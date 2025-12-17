@@ -140,12 +140,21 @@ impl<T> RingArena<T> {
         }
     }
 
+    fn free_and_allocate(&mut self, length: usize) -> Handle<T> {
+        self.deallocate();
+        if self.available_right() >= length || self.available_left() >= length {
+            self.allocate(length)
+        } else {
+            // fallback - allocate on the heap
+            Handle(HandleInner::Boxed(Box::new_uninit_slice(length)))
+        }
+    }
+
     pub fn allocate(&mut self, length: usize) -> Handle<T> {
         if length == 0 {
             return Handle(HandleInner::Boxed(Box::new_uninit_slice(0)));
         }
 
-        self.deallocate();
         if self.available_right() >= length {
             let start = self.right_index().unwrap_or(0);
             let handle = Handle(HandleInner::Arena {
@@ -175,8 +184,7 @@ impl<T> RingArena<T> {
 
             handle
         } else {
-            // fallback - allocate on the heap
-            Handle(HandleInner::Boxed(Box::new_uninit_slice(length)))
+            self.free_and_allocate(length)
         }
     }
 }
