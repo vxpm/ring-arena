@@ -141,6 +141,10 @@ impl<T> RingArena<T> {
     }
 
     pub fn allocate(&mut self, length: usize) -> Handle<T> {
+        if length == 0 {
+            return Handle(HandleInner::Boxed(Box::new_uninit_slice(0)));
+        }
+
         self.deallocate();
         if self.available_right() >= length {
             let start = self.right_index().unwrap_or(0);
