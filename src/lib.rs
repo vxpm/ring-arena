@@ -1,5 +1,5 @@
 use flume::{Receiver, Sender};
-use std::{collections::VecDeque, mem::MaybeUninit, ptr::NonNull};
+use std::{collections::VecDeque, mem::MaybeUninit, num::NonZero, ptr::NonNull};
 
 struct ArenaAllocation {
     start: usize,
@@ -80,11 +80,11 @@ pub struct RingArena<T> {
 }
 
 impl<T> RingArena<T> {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: NonZero<usize>) -> Self {
         let (sender, receiver) = flume::unbounded();
-        let mut storage = Vec::with_capacity(capacity);
+        let mut storage = Vec::with_capacity(capacity.get());
         // SAFETY: MaybeUninit is always considered initialized
-        unsafe { storage.set_len(capacity) };
+        unsafe { storage.set_len(capacity.get()) };
 
         Self {
             storage: storage.into_boxed_slice(),
@@ -95,32 +95,30 @@ impl<T> RingArena<T> {
         }
     }
 
+    /// Index of the (inclusive) start of the left-most allocation.
     #[inline(always)]
-    fn left_index(&self) -> usize {
-        let Some(first) = self.allocations.front() else {
-            return self.storage.len();
-        };
-
-        first.start
+    fn left_index(&self) -> Option<usize> {
+        self.allocations.front().map(|a| a.start)
     }
 
+    /// How many elements are available to the left.
     #[inline(always)]
     fn available_left(&self) -> usize {
-        self.left_index()
+        self.left_index().unwrap_or(self.storage.len())
     }
 
+    /// Index of the (exclusive) end of the right-most allocation.
     #[inline(always)]
-    fn right_index(&self) -> usize {
-        let Some(last) = self.allocations.back() else {
-            return self.storage.len();
-        };
-
-        last.end()
+    fn right_index(&self) -> Option<usize> {
+        self.allocations.back().map(|a| a.end())
     }
 
+    /// How many elements are available to the right.
     #[inline(always)]
     fn available_right(&self) -> usize {
-        self.storage.len() - self.right_index()
+        self.right_index()
+            .map(|i| self.storage.len() - i)
+            .unwrap_or(self.storage.len())
     }
 
     fn deallocate(&mut self) {
@@ -145,7 +143,7 @@ impl<T> RingArena<T> {
     pub fn allocate(&mut self, length: usize) -> Handle<T> {
         self.deallocate();
         if self.available_right() >= length {
-            let start = self.right_index();
+            let start = self.right_index().unwrap_or(0);
             let handle = Handle(HandleInner::Arena {
                 ptr: NonNull::slice_from_raw_parts(
                     NonNull::from_mut(&mut self.storage[start]),
@@ -159,7 +157,7 @@ impl<T> RingArena<T> {
 
             handle
         } else if self.available_left() >= length {
-            let start = self.left_index() - length;
+            let start = self.left_index().unwrap_or(self.storage.len()) - length;
             let handle = Handle(HandleInner::Arena {
                 ptr: NonNull::slice_from_raw_parts(
                     NonNull::from_mut(&mut self.storage[start]),
@@ -184,6 +182,7 @@ unsafe impl<T> Sync for RingArena<T> where T: Sync {}
 
 impl<T> Drop for RingArena<T> {
     fn drop(&mut self) {
+        self.deallocate();
         if !self.allocations.is_empty() {
             panic!("ring arena dropped while allocations exist");
         }
@@ -193,10 +192,11 @@ impl<T> Drop for RingArena<T> {
 #[cfg(test)]
 mod test {
     use crate::RingArena;
+    use std::num::NonZero;
 
     #[test]
     fn test() {
-        let mut arena = RingArena::<u32>::new(4);
+        let mut arena = RingArena::<u32>::new(NonZero::new(4).unwrap());
         let a = arena.allocate(1);
         let b = arena.allocate(3);
         let c = arena.allocate(2);
