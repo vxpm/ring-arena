@@ -1,9 +1,5 @@
-use std::{
-    collections::VecDeque,
-    mem::MaybeUninit,
-    ptr::NonNull,
-    sync::mpsc::{Receiver, Sender, channel},
-};
+use flume::{Receiver, Sender};
+use std::{collections::VecDeque, mem::MaybeUninit, ptr::NonNull};
 
 struct ArenaAllocation {
     start: usize,
@@ -85,7 +81,7 @@ pub struct RingArena<T> {
 
 impl<T> RingArena<T> {
     pub fn new(capacity: usize) -> Self {
-        let (sender, receiver) = channel();
+        let (sender, receiver) = flume::unbounded();
         let mut storage = Vec::with_capacity(capacity);
         // SAFETY: MaybeUninit is always considered initialized
         unsafe { storage.set_len(capacity) };
