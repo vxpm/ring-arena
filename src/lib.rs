@@ -183,6 +183,17 @@ impl<T> RingArena<T> {
     }
 }
 
+unsafe impl<T> Send for RingArena<T> where T: Send {}
+unsafe impl<T> Sync for RingArena<T> where T: Sync {}
+
+impl<T> Drop for RingArena<T> {
+    fn drop(&mut self) {
+        if !self.allocations.is_empty() {
+            panic!("ring arena dropped while allocations exist");
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::RingArena;
