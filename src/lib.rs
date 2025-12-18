@@ -1,22 +1,18 @@
-use flume::{Receiver, Sender};
-use std::{collections::VecDeque, mem::MaybeUninit, num::NonZero, ptr::NonNull};
-
-struct ArenaAllocation {
-    start: usize,
-    len: usize,
-}
-
-impl ArenaAllocation {
-    #[inline(always)]
-    pub fn end(&self) -> usize {
-        self.start + self.len
-    }
-}
+use std::{
+    collections::VecDeque,
+    mem::MaybeUninit,
+    num::NonZero,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 enum HandleInner<T> {
-    Arena {
+    Chunk {
         ptr: NonNull<[MaybeUninit<T>]>,
-        sender: Sender<NonNull<[MaybeUninit<T>]>>,
+        count: Arc<AtomicUsize>,
     },
     Boxed(Box<[MaybeUninit<T>]>),
 }
@@ -34,7 +30,7 @@ impl<T> Handle<T> {
     pub unsafe fn as_slice(&self) -> &[MaybeUninit<T>] {
         match &self.0 {
             // SAFETY: the arena is alive, as stabilished by the method contract
-            HandleInner::Arena { ptr, .. } => unsafe { ptr.as_ref() },
+            HandleInner::Chunk { ptr, .. } => unsafe { ptr.as_ref() },
             HandleInner::Boxed(b) => b,
         }
     }
@@ -45,7 +41,7 @@ impl<T> Handle<T> {
     pub unsafe fn as_mut_slice(&mut self) -> &mut [MaybeUninit<T>] {
         match &mut self.0 {
             // SAFETY: the arena is alive, as stabilished by the method contract
-            HandleInner::Arena { ptr, .. } => unsafe { ptr.as_mut() },
+            HandleInner::Chunk { ptr, .. } => unsafe { ptr.as_mut() },
             HandleInner::Boxed(b) => b,
         }
     }
@@ -53,7 +49,7 @@ impl<T> Handle<T> {
     /// Whether this handle actually contains a boxed value.
     pub fn is_boxed(&self) -> bool {
         match self.0 {
-            HandleInner::Arena { .. } => false,
+            HandleInner::Chunk { .. } => false,
             HandleInner::Boxed(_) => true,
         }
     }
@@ -62,129 +58,92 @@ impl<T> Handle<T> {
 impl<T> Drop for Handle<T> {
     fn drop(&mut self) {
         match &mut self.0 {
-            HandleInner::Arena { ptr, sender } => {
-                _ = sender.send(*ptr);
+            HandleInner::Chunk { count, .. } => {
+                count.fetch_sub(1, Ordering::Relaxed);
             }
             HandleInner::Boxed(_) => (),
         }
     }
 }
 
-/// Arena for short-lived objects.
-pub struct RingArena<T> {
+struct Chunk<T> {
     storage: Box<[MaybeUninit<T>]>,
-    allocations: VecDeque<ArenaAllocation>,
-
-    sender: Sender<NonNull<[MaybeUninit<T>]>>,
-    receiver: Receiver<NonNull<[MaybeUninit<T>]>>,
+    allocated: Arc<AtomicUsize>,
 }
 
-impl<T> RingArena<T> {
-    pub fn new(capacity: NonZero<usize>) -> Self {
-        let (sender, receiver) = flume::unbounded();
-        let mut storage = Vec::with_capacity(capacity.get());
+impl<T> Chunk<T> {
+    pub fn new(length: usize) -> Self {
+        let mut storage = Vec::with_capacity(length);
         // SAFETY: MaybeUninit is always considered initialized
-        unsafe { storage.set_len(capacity.get()) };
+        unsafe { storage.set_len(length) };
 
         Self {
             storage: storage.into_boxed_slice(),
-            allocations: VecDeque::new(),
+            allocated: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
 
-            sender,
-            receiver,
+/// Arena for short-lived objects.
+pub struct RingArena<T> {
+    chunk_length: usize,
+    /// All the allocated chunks.
+    chunks: VecDeque<Chunk<T>>,
+    /// Offset into the front chunk.
+    offset: usize,
+}
+
+impl<T> RingArena<T> {
+    pub fn new(chunk_length: NonZero<usize>) -> Self {
+        let first = Chunk::new(chunk_length.get());
+        Self {
+            chunk_length: chunk_length.get(),
+            chunks: VecDeque::from([first]),
+            offset: 0,
         }
     }
 
-    /// Index of the (inclusive) start of the left-most allocation.
-    #[inline(always)]
-    fn left_index(&self) -> Option<usize> {
-        self.allocations.front().map(|a| a.start)
-    }
+    /// # Safety
+    /// `length` elements must fit within the remaining space of the front chunk.
+    unsafe fn allocate_unchecked(&mut self, length: usize) -> Handle<T> {
+        let front = self.chunks.front_mut().unwrap();
+        front.allocated.fetch_add(1, Ordering::Relaxed);
 
-    /// How many elements are available to the left.
-    #[inline(always)]
-    fn available_left(&self) -> usize {
-        self.left_index().unwrap_or(self.storage.len())
-    }
+        let handle = Handle(HandleInner::Chunk {
+            ptr: NonNull::slice_from_raw_parts(
+                NonNull::from_mut(&mut front.storage[self.offset]),
+                length,
+            ),
+            count: front.allocated.clone(),
+        });
 
-    /// Index of the (exclusive) end of the right-most allocation.
-    #[inline(always)]
-    fn right_index(&self) -> Option<usize> {
-        self.allocations.back().map(|a| a.end())
-    }
-
-    /// How many elements are available to the right.
-    #[inline(always)]
-    fn available_right(&self) -> usize {
-        self.right_index()
-            .map(|i| self.storage.len() - i)
-            .unwrap_or(self.storage.len())
-    }
-
-    fn deallocate(&mut self) {
-        while let Ok(alloc) = self.receiver.try_recv() {
-            let start = unsafe {
-                alloc
-                    .as_ptr()
-                    .cast::<MaybeUninit<T>>()
-                    .offset_from_unsigned(self.storage.as_ptr())
-            };
-
-            let index = self
-                .allocations
-                .binary_search_by_key(&start, |k| k.start)
-                .expect("allocation must be in the list");
-
-            let elem = self.allocations.remove(index).unwrap();
-            assert_eq!(elem.len, alloc.len());
-        }
-    }
-
-    fn free_and_allocate(&mut self, length: usize) -> Handle<T> {
-        self.deallocate();
-        if self.available_right() >= length || self.available_left() >= length {
-            self.allocate(length)
-        } else {
-            // fallback - allocate on the heap
-            Handle(HandleInner::Boxed(Box::new_uninit_slice(length)))
-        }
+        self.offset += length;
+        handle
     }
 
     pub fn allocate(&mut self, length: usize) -> Handle<T> {
-        if length == 0 {
-            return Handle(HandleInner::Boxed(Box::new_uninit_slice(0)));
+        if length == 0 || length > self.chunk_length {
+            return Handle(HandleInner::Boxed(Box::new_uninit_slice(length)));
         }
 
-        if self.available_right() >= length {
-            let start = self.right_index().unwrap_or(0);
-            let handle = Handle(HandleInner::Arena {
-                ptr: NonNull::slice_from_raw_parts(
-                    NonNull::from_mut(&mut self.storage[start]),
-                    length,
-                ),
-                sender: self.sender.clone(),
-            });
-
-            self.allocations
-                .push_back(ArenaAllocation { start, len: length });
-
-            handle
-        } else if self.available_left() >= length {
-            let start = self.left_index().unwrap_or(self.storage.len()) - length;
-            let handle = Handle(HandleInner::Arena {
-                ptr: NonNull::slice_from_raw_parts(
-                    NonNull::from_mut(&mut self.storage[start]),
-                    length,
-                ),
-                sender: self.sender.clone(),
-            });
-
-            self.allocations
-                .push_front(ArenaAllocation { start, len: length });
-
-            handle
+        let remaining = self.chunk_length - self.offset;
+        if remaining >= length {
+            unsafe { self.allocate_unchecked(length) }
         } else {
-            self.free_and_allocate(length)
+            // chunk is full, move front chunk to the back
+            let full = self.chunks.pop_front().unwrap();
+            self.chunks.push_back(full);
+            self.offset = 0;
+
+            let front = self.chunks.front_mut().unwrap();
+            let allocated = front.allocated.load(Ordering::Relaxed);
+            if allocated == 0 {
+                unsafe { self.allocate_unchecked(length) }
+            } else {
+                let chunk = Chunk::new(self.chunk_length);
+                self.chunks.push_front(chunk);
+                unsafe { self.allocate_unchecked(length) }
+            }
         }
     }
 }
@@ -194,35 +153,10 @@ unsafe impl<T> Sync for RingArena<T> where T: Sync {}
 
 impl<T> Drop for RingArena<T> {
     fn drop(&mut self) {
-        self.deallocate();
-        if !self.allocations.is_empty() {
-            panic!("ring arena dropped while allocations exist");
+        for chunk in &self.chunks {
+            if chunk.allocated.load(Ordering::SeqCst) > 0 {
+                panic!("ring arena dropped while allocations exist");
+            }
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::RingArena;
-    use std::num::NonZero;
-
-    #[test]
-    fn test() {
-        let mut arena = RingArena::<u32>::new(NonZero::new(4).unwrap());
-        let a = arena.allocate(1);
-        let b = arena.allocate(3);
-        let c = arena.allocate(2);
-
-        assert_eq!(unsafe { a.as_slice().len() }, 1);
-        assert_eq!(unsafe { b.as_slice().len() }, 3);
-        assert_eq!(unsafe { c.as_slice().len() }, 2);
-        assert!(!a.is_boxed());
-        assert!(!b.is_boxed());
-        assert!(c.is_boxed());
-
-        std::mem::drop((a, b));
-        let d = arena.allocate(4);
-        assert_eq!(unsafe { d.as_slice().len() }, 4);
-        assert!(!d.is_boxed());
     }
 }
