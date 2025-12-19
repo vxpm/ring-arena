@@ -1,18 +1,10 @@
-use std::{
-    collections::VecDeque,
-    mem::MaybeUninit,
-    num::NonZero,
-    ptr::NonNull,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{collections::VecDeque, mem::MaybeUninit, num::NonZero, ptr::NonNull};
+use triomphe::Arc;
 
 enum HandleInner<T> {
     Chunk {
         ptr: NonNull<[MaybeUninit<T>]>,
-        count: Arc<AtomicUsize>,
+        _count: Arc<()>,
     },
     Boxed(Box<[MaybeUninit<T>]>),
 }
@@ -55,20 +47,9 @@ impl<T> Handle<T> {
     }
 }
 
-impl<T> Drop for Handle<T> {
-    fn drop(&mut self) {
-        match &mut self.0 {
-            HandleInner::Chunk { count, .. } => {
-                count.fetch_sub(1, Ordering::Relaxed);
-            }
-            HandleInner::Boxed(_) => (),
-        }
-    }
-}
-
 struct Chunk<T> {
     storage: Box<[MaybeUninit<T>]>,
-    allocated: Arc<AtomicUsize>,
+    allocated: Arc<()>,
 }
 
 impl<T> Chunk<T> {
@@ -79,7 +60,7 @@ impl<T> Chunk<T> {
 
         Self {
             storage: storage.into_boxed_slice(),
-            allocated: Arc::new(AtomicUsize::new(0)),
+            allocated: Arc::new(()),
         }
     }
 }
@@ -107,14 +88,12 @@ impl<T> RingArena<T> {
     /// `length` elements must fit within the remaining space of the front chunk.
     unsafe fn allocate_unchecked(&mut self, length: usize) -> Handle<T> {
         let front = self.chunks.front_mut().unwrap();
-        front.allocated.fetch_add(1, Ordering::Relaxed);
-
         let handle = Handle(HandleInner::Chunk {
             ptr: NonNull::slice_from_raw_parts(
                 NonNull::from_mut(&mut front.storage[self.offset]),
                 length,
             ),
-            count: front.allocated.clone(),
+            _count: front.allocated.clone(),
         });
 
         self.offset += length;
@@ -136,8 +115,7 @@ impl<T> RingArena<T> {
             self.offset = 0;
 
             let front = self.chunks.front_mut().unwrap();
-            let allocated = front.allocated.load(Ordering::Relaxed);
-            if allocated == 0 {
+            if front.allocated.is_unique() {
                 unsafe { self.allocate_unchecked(length) }
             } else {
                 let chunk = Chunk::new(self.chunk_length);
@@ -154,7 +132,7 @@ unsafe impl<T> Sync for RingArena<T> where T: Sync {}
 impl<T> Drop for RingArena<T> {
     fn drop(&mut self) {
         for chunk in &self.chunks {
-            if chunk.allocated.load(Ordering::SeqCst) > 0 {
+            if !chunk.allocated.is_unique() {
                 panic!("ring arena dropped while allocations exist");
             }
         }

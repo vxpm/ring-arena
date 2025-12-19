@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 flume = { version = "0.12", default-features = false }
+triomphe = { version = "0.1", default-features = false, features = [
+    "std",
+    "stable_deref_trait",
+] }
